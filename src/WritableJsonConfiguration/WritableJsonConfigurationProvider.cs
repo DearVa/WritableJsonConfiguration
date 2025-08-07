@@ -16,7 +16,7 @@ public class WritableJsonConfigurationProvider : JsonConfigurationProvider
 
     private void Save(JsonNode jsonObj)
     {
-        var output = jsonObj.ToJsonString();
+        var output = jsonObj.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
         File.WriteAllText(_fileFullPath, output);
     }
 
@@ -31,34 +31,42 @@ public class WritableJsonConfigurationProvider : JsonConfigurationProvider
             var currentKey = split[i];
             if (i < split.Length - 1)
             {
-                if (context is JsonObject contextObj)
+                if (int.TryParse(currentKey, out var index) && context is JsonArray array)
                 {
-                    if (!contextObj.ContainsKey(currentKey))
+                    while (array.Count <= index)
                     {
-                        JsonNode newNode = i + 1 < split.Length && int.TryParse(split[i + 1], out _)
-                            ? new JsonArray()
-                            : new JsonObject();
-                        contextObj[currentKey] = newNode;
+                        array.Add(null);
                     }
-                    context = contextObj[currentKey];
+
+                    context = array[index] ??= CreateChild();
                 }
+                else
+                {
+                    context = context[currentKey] ??= CreateChild();
+                }
+
+                JsonNode CreateChild() =>
+                    i + 1 < split.Length && int.TryParse(split[i + 1], out _) ? new JsonArray() : new JsonObject();
             }
             else
             {
-                if (int.TryParse(currentKey, out var index))
+                switch (context)
                 {
-                    if (context is JsonArray array)
+                    case JsonArray array when int.TryParse(currentKey, out var index):
                     {
                         while (array.Count <= index)
                         {
-                            array.Add(JsonValue.Create("")); // 填充数组到指定索引
+                            array.Add(null);
                         }
+
                         array[index] = JsonValue.Create(value);
+                        break;
                     }
-                }
-                else if (context is JsonObject contextObj)
-                {
-                    contextObj[currentKey] = JsonValue.Create(value);
+                    case JsonObject obj:
+                    {
+                        obj[currentKey] = JsonValue.Create(value);
+                        break;
+                    }
                 }
             }
         }
@@ -79,9 +87,8 @@ public class WritableJsonConfigurationProvider : JsonConfigurationProvider
 
     public void Set(string key, object value)
     {
+        var jsonNode = JsonSerializer.SerializeToNode(value);
         var jsonObj = GetJsonObj();
-        var serialized = JsonSerializer.Serialize(value);
-        var jsonNode = JsonNode.Parse(serialized);
         WalkAndSet(key, jsonNode, jsonObj);
         Save(jsonObj);
     }
@@ -91,6 +98,7 @@ public class WritableJsonConfigurationProvider : JsonConfigurationProvider
         switch (value)
         {
             case JsonArray jArray:
+            {
                 for (var index = 0; index < jArray.Count; index++)
                 {
                     var currentKey = $"{key}:{index}";
@@ -98,8 +106,9 @@ public class WritableJsonConfigurationProvider : JsonConfigurationProvider
                     WalkAndSet(currentKey, elementValue, jsonObj);
                 }
                 break;
-
+            }
             case JsonObject jObject:
+            {
                 foreach (var property in jObject.AsObject())
                 {
                     var propName = property.Key;
@@ -107,14 +116,17 @@ public class WritableJsonConfigurationProvider : JsonConfigurationProvider
                     WalkAndSet(currentKey, property.Value, jsonObj);
                 }
                 break;
-
+            }
             case JsonValue jValue:
+            {
                 SetValue(key, jValue.ToString(), jsonObj);
                 break;
-
+            }
             default:
+            {
                 SetValue(key, null, jsonObj);
                 break;
+            }
         }
     }
 }
