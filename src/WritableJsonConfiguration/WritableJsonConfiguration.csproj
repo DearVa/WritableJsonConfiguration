@@ -1,14 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-        <TargetFramework>netstandard2.0</TargetFramework>
         <Authors>Kibnet</Authors>
         <RepositoryUrl>https://github.com/Kibnet/WritableJsonConfiguration</RepositoryUrl>
         <PackageProjectUrl>https://github.com/Kibnet/WritableJsonConfiguration</PackageProjectUrl>
         <PackageVersion>8.0.0</PackageVersion>
         <Description>Source of configurations in JSON format with the ability to edit values directly from the running application. Based on Microsoft.Extensions.Configuration.</Description>
         <PackageIcon>JSON_logo.png</PackageIcon>
-        <Nullable>disable</Nullable>
     </PropertyGroup>
 
     <ItemGroup>
@@ -20,7 +18,6 @@
     <ItemGroup>
         <None Include="..\..\resources\JSON_logo.png">
             <Pack>True</Pack>
-            <PackagePath></PackagePath>
         </None>
     </ItemGroup>
 

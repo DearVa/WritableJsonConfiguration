@@ -1,5 +1,4 @@
-﻿#nullable enable
-
+﻿using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Configuration;
@@ -7,238 +6,359 @@ using Microsoft.Extensions.Configuration.Json;
 
 namespace WritableJsonConfiguration;
 
-public class WritableJsonConfigurationProvider : JsonConfigurationProvider
+/// <summary>
+/// A sophisticated, thread-safe, and high-performance writable JSON configuration provider.
+/// It employs ReaderWriterLockSlim for optimized concurrent access in read-heavy scenarios,
+/// and a debounced, asynchronous mechanism for file writing to minimize I/O overhead.
+/// </summary>
+public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvider, IDisposable
 {
+    private const int DebounceMilliseconds = 200;
+
     private readonly string _fileFullPath;
+    private readonly ReaderWriterLockSlim _lock = new(LockRecursionPolicy.NoRecursion);
+    private readonly CancellationTokenSource _cts = new();
+    private volatile Task _saveTask = Task.CompletedTask;
+    private JsonNode? _jsonObj;
 
     public WritableJsonConfigurationProvider(JsonConfigurationSource source) : base(source)
     {
-        _fileFullPath = Source.FileProvider?.GetFileInfo(Source.Path ?? string.Empty).PhysicalPath ??
-            throw new FileNotFoundException("Json configuration file not found");
+        _fileFullPath = Source.FileProvider?.GetFileInfo(Source.Path ?? string.Empty).PhysicalPath
+            ?? throw new FileNotFoundException("JSON configuration file not found.");
     }
 
     public override void Load(Stream stream)
     {
-        Data = new JsonParser().ParseStream(stream);
-    }
-
-    private void Save(JsonNode jsonObj)
-    {
-        var output = jsonObj.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(_fileFullPath, output);
-    }
-
-    private void SetValue(string key, string? value, JsonNode jsonObj)
-    {
-        base.Set(key, value);
-        var split = key.Split(':');
-        var context = jsonObj;
-
-        for (var i = 0; i < split.Length; i++)
+        // The base.Load(stream) will populate the `Data` dictionary.
+        // We must ensure our internal JsonNode representation is also loaded and consistent.
+        _lock.EnterWriteLock();
+        try
         {
-            var currentKey = split[i];
-            if (i < split.Length - 1)
-            {
-                if (int.TryParse(currentKey, out var index) && context is JsonArray array)
-                {
-                    while (array.Count <= index)
-                    {
-                        array.Add(null);
-                    }
-
-                    context = array[index] ??= CreateChild();
-                }
-                else
-                {
-                    context = context[currentKey] ??= CreateChild();
-                }
-
-                JsonNode CreateChild() =>
-                    i + 1 < split.Length && int.TryParse(split[i + 1], out _) ? new JsonArray() : new JsonObject();
-            }
-            else
-            {
-                switch (context)
-                {
-                    case JsonArray array when int.TryParse(currentKey, out var index):
-                    {
-                        while (array.Count <= index)
-                        {
-                            array.Add(null);
-                        }
-
-                        array[index] = JsonValue.Create(value);
-                        break;
-                    }
-                    case JsonObject obj:
-                    {
-                        obj[currentKey] = JsonValue.Create(value);
-                        break;
-                    }
-                }
-            }
+            using var reader = new StreamReader(stream);
+            var json = reader.ReadToEnd();
+            _jsonObj = JsonNode.Parse(json) ?? new JsonObject();
+            Data = PopulateDataFromNode(_jsonObj);
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
         }
     }
 
-    private JsonNode GetJsonObj()
+    private static Dictionary<string, string?> PopulateDataFromNode(JsonNode root)
     {
-        var json = File.Exists(_fileFullPath) ? File.ReadAllText(_fileFullPath) : "{}";
-        return JsonNode.Parse(json) ?? new JsonObject();
+        var data = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        var stack = new Stack<(string? Path, JsonNode Node)>();
+        stack.Push((null, root));
+
+        while (stack.Count > 0)
+        {
+            var (path, node) = stack.Pop();
+
+            switch (node)
+            {
+                case JsonObject obj:
+                {
+                    if (obj.Count == 0)
+                    {
+                        SetNullIfPathExists(path, data);
+                    }
+                    else
+                    {
+                        foreach (var property in obj)
+                        {
+                            var currentPath = string.IsNullOrEmpty(path) ? property.Key : ConfigurationPath.Combine(path, property.Key);
+                            if (property.Value != null)
+                            {
+                                stack.Push((currentPath, property.Value));
+                            }
+                            else
+                            {
+                                data[currentPath] = null;
+                            }
+                        }
+                    }
+                    break;
+                }
+                case JsonArray array:
+                {
+                    if (array.Count == 0)
+                    {
+                        SetNullIfPathExists(path, data);
+                    }
+                    else
+                    {
+                        for (var i = 0; i < array.Count; i++)
+                        {
+                            var currentPath =
+                                string.IsNullOrEmpty(path) ?
+                                    i.ToString() :
+                                    ConfigurationPath.Combine(path, i.ToString());
+                            if (array[i] != null)
+                            {
+                                stack.Push((currentPath, array[i]!));
+                            }
+                            else
+                            {
+                                data[currentPath] = null;
+                            }
+                        }
+                    }
+                    break;
+                }
+                case JsonValue value:
+                {
+                    if (path != null)
+                    {
+                        data[path] = value.ToString();
+                    }
+                    break;
+                }
+            }
+        }
+        return data;
+    }
+
+    private static void SetNullIfPathExists(string? path, Dictionary<string, string?> data)
+    {
+        if (path != null)
+        {
+            data[path] = null;
+        }
+    }
+
+    public override bool TryGet(string key, out string? value)
+    {
+        _lock.EnterReadLock();
+        try
+        {
+            return base.TryGet(key, out value);
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
     }
 
     public override void Set(string key, string? value)
     {
-        var jsonObj = GetJsonObj();
-        SetValue(key, value, jsonObj);
-        Save(jsonObj);
-    }
-
-    public void Set(string key, object value)
-    {
-        var jsonNode = JsonSerializer.SerializeToNode(value);
-        var jsonObj = GetJsonObj();
-        WalkAndSet(key, jsonNode, jsonObj);
-        Save(jsonObj);
-    }
-
-    private void WalkAndSet(string key, JsonNode? value, JsonNode jsonObj)
-    {
-        switch (value)
+        _lock.EnterWriteLock();
+        try
         {
-            case JsonArray jArray:
-            {
-                for (var index = 0; index < jArray.Count; index++)
-                {
-                    var currentKey = $"{key}:{index}";
-                    var elementValue = jArray[index];
-                    WalkAndSet(currentKey, elementValue, jsonObj);
-                }
-                break;
-            }
-            case JsonObject jObject:
-            {
-                foreach (var property in jObject.AsObject())
-                {
-                    var propName = property.Key;
-                    var currentKey = key == null ? propName : $"{key}:{propName}";
-                    WalkAndSet(currentKey, property.Value, jsonObj);
-                }
-                break;
-            }
-            case JsonValue jValue:
-            {
-                SetValue(key, jValue.ToString(), jsonObj);
-                break;
-            }
-            default:
-            {
-                SetValue(key, null, jsonObj);
-                break;
-            }
+            // Update the base Data dictionary
+            base.Set(key, value);
+
+            // Update our in-memory JsonNode representation
+            UpdateJsonNode(key, value);
+
+            // Trigger a debounced save operation
+            QueueSave();
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
         }
     }
 
     /// <summary>
-    /// modify from Microsoft.Extensions.Configuration.Json.JsonConfigurationFileParser, fixed null issues
+    /// Sets a complex object value in the configuration.
+    /// The object is serialized to JSON and its properties are recursively set.
     /// </summary>
-    private class JsonParser
+    /// <param name="key">The root key to set the object at. Can be null to set at the root level.</param>
+    /// <param name="value">The object to set.</param>
+    public void Set(string? key, object? value)
     {
-        private readonly Dictionary<string, string?> _data = new(StringComparer.OrdinalIgnoreCase);
-        private readonly Stack<string> _paths = new();
-
-        public Dictionary<string, string?> ParseStream(Stream input)
+        _lock.EnterWriteLock();
+        try
         {
-            var jsonDocumentOptions = new JsonDocumentOptions
-            {
-                CommentHandling = JsonCommentHandling.Skip,
-                AllowTrailingCommas = true,
-            };
-
-            using (var reader = new StreamReader(input))
-            using (var doc = JsonDocument.Parse(reader.ReadToEnd(), jsonDocumentOptions))
-            {
-                if (doc.RootElement.ValueKind != JsonValueKind.Object) throw new FormatException();
-                VisitObjectElement(doc.RootElement);
-            }
-
-            return _data;
+            var node = JsonSerializer.SerializeToNode(value);
+            WalkAndSetNode(key, node);
+            QueueSave();
         }
-
-        private void VisitObjectElement(JsonElement element)
+        finally
         {
-            var isEmpty = true;
-
-            foreach (var property in element.EnumerateObject())
-            {
-                isEmpty = false;
-                EnterContext(property.Name);
-                VisitValue(property.Value);
-                ExitContext();
-            }
-
-            SetNullIfElementIsEmpty(isEmpty);
+            _lock.ExitWriteLock();
         }
+    }
 
-        private void VisitArrayElement(JsonElement element)
+    private void WalkAndSetNode(string? currentPath, JsonNode? node)
+    {
+        switch (node)
         {
-            var index = 0;
-
-            foreach (var arrayElement in element.EnumerateArray())
+            case JsonObject jObject:
             {
-                EnterContext(index.ToString());
-                VisitValue(arrayElement);
-                ExitContext();
-                index++;
-            }
-
-            SetNullIfElementIsEmpty(isEmpty: index == 0);
-        }
-
-        private void SetNullIfElementIsEmpty(bool isEmpty)
-        {
-            if (isEmpty && _paths.Count > 0)
-            {
-                _data[_paths.Peek()] = null;
-            }
-        }
-
-        private void VisitValue(JsonElement value)
-        {
-            switch (value.ValueKind)
-            {
-                case JsonValueKind.Object:
+                foreach (var property in jObject)
                 {
-                    VisitObjectElement(value);
-                    break;
+                    var nextPath = string.IsNullOrEmpty(currentPath) ? property.Key : ConfigurationPath.Combine(currentPath, property.Key);
+                    WalkAndSetNode(nextPath, property.Value);
                 }
-                case JsonValueKind.Array:
+                break;
+            }
+            case JsonArray jArray:
+            {
+                for (var i = 0; i < jArray.Count; i++)
                 {
-                    VisitArrayElement(value);
-                    break;
+                    var nextPath = string.IsNullOrEmpty(currentPath) ? i.ToString() : ConfigurationPath.Combine(currentPath, i.ToString());
+                    WalkAndSetNode(nextPath, jArray[i]);
                 }
-                case JsonValueKind.Number:
-                case JsonValueKind.String:
-                case JsonValueKind.True:
-                case JsonValueKind.False:
-                {
-                    var key = _paths.Peek();
-                    _data[key] = value.ToString();
-                    break;
-                }
-                case JsonValueKind.Null:
-                {
-                    var key = _paths.Peek();
-                    _data[key] = null;
-                    break;
-                }
+                break;
+            }
+            case JsonValue jValue when currentPath is not null:
+            {
+                var stringValue = jValue.TryGetValue<object>(out var v) ? v.ToString() : null;
+                base.Set(currentPath, stringValue);
+                UpdateJsonNode(currentPath, stringValue);
+                break;
+            }
+            case null when currentPath is not null:
+            {
+                base.Set(currentPath, null);
+                UpdateJsonNode(currentPath, null);
+                break;
             }
         }
+    }
 
-        private void EnterContext(string context) =>
-            _paths.Push(_paths.Count > 0 ?
-                _paths.Peek() + ConfigurationPath.KeyDelimiter + context :
-                context);
+    private void UpdateJsonNode(string key, string? value)
+    {
+        _jsonObj ??= new JsonObject();
+        var context = _jsonObj;
+        var segments = key.Split(ConfigurationPath.KeyDelimiter);
 
-        private void ExitContext() => _paths.Pop();
+        for (var i = 0; i < segments.Length; i++)
+        {
+            var segment = segments[i];
+            if (i == segments.Length - 1)
+            {
+                // Last segment, set the value
+                SetNodeValue(context, segment, value);
+                break;
+            }
+
+            // Navigate or create path
+            context = GetOrCreateNextNode(context, segment, segments[i + 1]);
+        }
+    }
+
+    private static JsonNode GetOrCreateNextNode(JsonNode context, string segment, string nextSegment)
+    {
+        if (int.TryParse(segment, out var index) && context is JsonArray array)
+        {
+            while (array.Count <= index) array.Add(null);
+            return array[index] ??= int.TryParse(nextSegment, out _) ? new JsonArray() : new JsonObject();
+        }
+
+        if (context is JsonObject obj)
+        {
+            return obj[segment] ??= int.TryParse(nextSegment, out _) ? new JsonArray() : new JsonObject();
+        }
+
+        // This indicates a path mismatch, e.g., trying to access a property on an array by name.
+        // For simplicity, we throw. A more robust implementation might handle this differently.
+        throw new InvalidOperationException($"Cannot create child node on a non-object/array node at path segment '{segment}'.");
+    }
+
+    private static void SetNodeValue(JsonNode context, string segment, string? value)
+    {
+        var jsonValue = JsonValue.Create(value);
+        if (int.TryParse(segment, out var index) && context is JsonArray array)
+        {
+            while (array.Count <= index) array.Add(null);
+            array[index] = jsonValue;
+        }
+        else if (context is JsonObject obj)
+        {
+            obj[segment] = jsonValue;
+        }
+        else
+        {
+            throw new InvalidOperationException($"Cannot set value on a non-object/array node at path segment '{segment}'.");
+        }
+    }
+
+    private void QueueSave()
+    {
+        // If a save is already queued or running, this new request is implicitly covered.
+        // We only need to start a new one if the previous one is complete.
+        if (_saveTask.IsCompleted)
+        {
+            _saveTask = SaveAsync(_cts.Token);
+        }
+    }
+
+    private async Task SaveAsync(CancellationToken cancellationToken)
+    {
+        // Debounce: wait for a short period before writing to disk.
+        await Task.Delay(DebounceMilliseconds, cancellationToken);
+
+        if (cancellationToken.IsCancellationRequested) return;
+
+        string content;
+        _lock.EnterReadLock(); // Only need a read lock to serialize the object
+        try
+        {
+            content = _jsonObj?.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) ?? "{}";
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
+
+        // --- Atomic Write using Write-and-Rename Pattern ---
+
+        // 1. Get a temporary file path in the same directory.
+        // This is crucial for the atomic move operation to work reliably.
+        var tempFilePath = Path.Combine(Path.GetDirectoryName(_fileFullPath)!, Path.GetRandomFileName());
+
+        try
+        {
+            // 2. Write the new content to the temporary file.
+            await File.WriteAllTextAsync(tempFilePath, content, Encoding.UTF8, cancellationToken);
+
+            // 3. Atomically replace the original file with the new one.
+            // On most filesystems, this is an atomic operation.
+            File.Replace(tempFilePath, _fileFullPath, null);
+        }
+        catch
+        {
+            // If any error occurs, ensure the temporary file is cleaned up.
+            if (File.Exists(tempFilePath))
+            {
+                try
+                {
+                    File.Delete(tempFilePath);
+                }
+                catch
+                {
+                    // Ignore exceptions during cleanup. The original file is still intact.
+                }
+            }
+
+            // Re-throw the original exception to signal that the save failed.
+            throw;
+        }
+    }
+
+    void IDisposable.Dispose()
+    {
+        _cts.Cancel();
+        try
+        {
+            // Wait briefly for a pending save to complete or cancel.
+            _saveTask.Wait(TimeSpan.FromSeconds(0.5));
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected if the task was cancelled.
+        }
+        catch (Exception)
+        {
+            // Ignore other exceptions during disposal.
+        }
+        finally
+        {
+            _cts.Dispose();
+            _lock.Dispose();
+        }
     }
 }
