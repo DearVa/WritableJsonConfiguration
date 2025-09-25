@@ -18,8 +18,11 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
     private readonly string _fileFullPath;
     private readonly ReaderWriterLockSlim _lock = new(LockRecursionPolicy.NoRecursion);
     private readonly CancellationTokenSource _cts = new();
-    private volatile Task _saveTask = Task.CompletedTask;
     private JsonNode? _jsonObj;
+
+    // Initialize to a completed task to simplify the logic.
+    private Task _saveTask = Task.CompletedTask;
+    private int _saveQueued; // 0 = false, 1 = true
 
     public WritableJsonConfigurationProvider(JsonConfigurationSource source) : base(source)
     {
@@ -168,10 +171,13 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
     /// <param name="value">The object to set.</param>
     public void Set(string? key, object? value)
     {
+        // Serialize outside the lock to prevent potential deadlocks if serialization
+        // logic tries to read configuration.
+        var node = JsonSerializer.SerializeToNode(value);
+
         _lock.EnterWriteLock();
         try
         {
-            var node = JsonSerializer.SerializeToNode(value);
             WalkAndSetNode(key, node);
             QueueSave();
         }
@@ -278,19 +284,56 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
 
     private void QueueSave()
     {
-        // If a save is already queued or running, this new request is implicitly covered.
-        // We only need to start a new one if the previous one is complete.
+        // Mark that a save is desired.
+        Interlocked.Exchange(ref _saveQueued, 1);
+
+        // If the save task is already completed, start a new one.
+        // This check is not atomic, but SaveLoopAsync handles the race condition internally.
         if (_saveTask.IsCompleted)
         {
-            _saveTask = SaveAsync(_cts.Token);
+            _saveTask = SaveLoopAsync();
         }
     }
 
-    private async Task SaveAsync(CancellationToken cancellationToken)
+    private async Task SaveLoopAsync()
     {
-        // Debounce: wait for a short period before writing to disk.
-        await Task.Delay(DebounceMilliseconds, cancellationToken);
+        // Loop while there are pending saves or cancellation hasn't been requested yet.
+        while (!_cts.IsCancellationRequested)
+        {
+            try
+            {
+                // Debounce: wait for a quiet period.
+                await Task.Delay(DebounceMilliseconds, _cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                // This is expected when Dispose is called. Break the loop to perform a final save.
+                break;
+            }
 
+            // Atomically check if a save is needed and reset the flag.
+            if (Interlocked.Exchange(ref _saveQueued, 0) == 0)
+            {
+                // No save was requested during the delay. We can exit the loop.
+                break;
+            }
+
+            // Perform the save.
+            await SaveToFileAsync(_cts.Token);
+        }
+
+        // After the loop (either by breaking or cancellation),
+        // there might be a pending save request that came in after the last check.
+        // Perform one final save if needed, ensuring data is not lost on disposal.
+        if (Interlocked.Exchange(ref _saveQueued, 0) == 1)
+        {
+            // Use CancellationToken.None to ensure this final write completes even if disposal has been initiated.
+            await SaveToFileAsync(CancellationToken.None);
+        }
+    }
+
+    private async Task SaveToFileAsync(CancellationToken cancellationToken)
+    {
         if (cancellationToken.IsCancellationRequested) return;
 
         string content;
@@ -306,54 +349,59 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
 
         // --- Atomic Write using Write-and-Rename Pattern ---
 
-        // 1. Get a temporary file path in the same directory.
-        // This is crucial for the atomic move operation to work reliably.
-        var tempFilePath = Path.Combine(Path.GetDirectoryName(_fileFullPath)!, Path.GetRandomFileName());
-
-        try
+        if (File.Exists(_fileFullPath))
         {
-            // 2. Write the new content to the temporary file.
-            await File.WriteAllTextAsync(tempFilePath, content, Encoding.UTF8, cancellationToken);
+            // 1. Get a temporary file path in the same directory.
+            // This is crucial for the atomic move operation to work reliably.
+            var tempFilePath = Path.Combine(Path.GetDirectoryName(_fileFullPath)!, Path.GetRandomFileName());
 
-            // 3. Atomically replace the original file with the new one.
-            // On most filesystems, this is an atomic operation.
-            File.Replace(tempFilePath, _fileFullPath, null);
-        }
-        catch
-        {
-            // If any error occurs, ensure the temporary file is cleaned up.
-            if (File.Exists(tempFilePath))
+            try
             {
-                try
-                {
-                    File.Delete(tempFilePath);
-                }
-                catch
-                {
-                    // Ignore exceptions during cleanup. The original file is still intact.
-                }
-            }
+                // 2. Write the new content to the temporary file.
+                await File.WriteAllTextAsync(tempFilePath, content, Encoding.UTF8, cancellationToken);
 
-            // Re-throw the original exception to signal that the save failed.
-            throw;
+                // 3. Atomically replace the original file with the new one.
+                // On most filesystems, this is an atomic operation.
+                File.Replace(tempFilePath, _fileFullPath, null);
+            }
+            catch
+            {
+                // If any error occurs, ensure the temporary file is cleaned up.
+                if (File.Exists(tempFilePath))
+                {
+                    try
+                    {
+                        File.Delete(tempFilePath);
+                    }
+                    catch
+                    {
+                        // Ignore exceptions during cleanup. The original file is still intact.
+                    }
+                }
+
+                // Re-throw the original exception to signal that the save failed.
+                throw;
+            }
+        }
+        else
+        {
+            await File.WriteAllTextAsync(_fileFullPath, content, Encoding.UTF8, cancellationToken);
         }
     }
 
     void IDisposable.Dispose()
     {
+        // Signal cancellation to the running task's loop.
         _cts.Cancel();
         try
         {
-            // Wait briefly for a pending save to complete or cancel.
-            _saveTask.Wait(TimeSpan.FromSeconds(0.5));
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected if the task was cancelled.
+            // Wait for the save task to complete gracefully.
+            // This now correctly waits for the final save operation if one was pending.
+            _saveTask.Wait();
         }
         catch (Exception)
         {
-            // Ignore other exceptions during disposal.
+            // Log or ignore other exceptions during disposal.
         }
         finally
         {
