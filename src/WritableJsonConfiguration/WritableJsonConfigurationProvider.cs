@@ -52,6 +52,19 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
             ?? throw new FileNotFoundException("JSON configuration file not found.");
     }
 
+    public override IEnumerable<string> GetChildKeys(IEnumerable<string> earlierKeys, string? parentPath)
+    {
+        _lock.EnterReadLock();
+        try
+        {
+            return base.GetChildKeys(earlierKeys, parentPath);
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
+    }
+
     public override void Load(Stream stream)
     {
         // The base.Load(stream) will populate the `Data` dictionary.
@@ -174,7 +187,7 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
             base.Set(key, value);
 
             // Update our in-memory JsonNode representation
-            UpdateJsonNode(key, value);
+            ReplaceSubtree(key, value);
 
             // Trigger a debounced save operation
             QueueSave();
@@ -200,7 +213,7 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
         _lock.EnterWriteLock();
         try
         {
-            WalkAndSetNode(key, node);
+            ReplaceSubtree(key, node);
             QueueSave();
         }
         finally
@@ -209,98 +222,137 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
         }
     }
 
-    private void WalkAndSetNode(string? currentPath, JsonNode? node)
-    {
-        switch (node)
-        {
-            case JsonObject jObject:
-            {
-                foreach (var property in jObject)
-                {
-                    var nextPath = string.IsNullOrEmpty(currentPath) ? property.Key : ConfigurationPath.Combine(currentPath, property.Key);
-                    WalkAndSetNode(nextPath, property.Value);
-                }
-                break;
-            }
-            case JsonArray jArray:
-            {
-                for (var i = 0; i < jArray.Count; i++)
-                {
-                    var nextPath = string.IsNullOrEmpty(currentPath) ? i.ToString() : ConfigurationPath.Combine(currentPath, i.ToString());
-                    WalkAndSetNode(nextPath, jArray[i]);
-                }
-                break;
-            }
-            case JsonValue jValue when currentPath is not null:
-            {
-                var stringValue = jValue.TryGetValue<object>(out var v) ? v.ToString() : null;
-                base.Set(currentPath, stringValue);
-                UpdateJsonNode(currentPath, stringValue);
-                break;
-            }
-            case null when currentPath is not null:
-            {
-                base.Set(currentPath, null);
-                UpdateJsonNode(currentPath, null);
-                break;
-            }
-        }
-    }
-
-    private void UpdateJsonNode(string key, string? value)
+    /// <summary>
+    /// Replace an entire subtree at the specified configuration path (atomic logical replacement).
+    /// Ensures arrays shrink properly by removing stale indices.
+    /// </summary>
+    private void ReplaceSubtree(string? key, JsonNode? newNode)
     {
         _jsonObj ??= new JsonObject();
-        var context = _jsonObj;
-        var segments = key.Split(ConfigurationPath.KeyDelimiter);
 
-        for (var i = 0; i < segments.Length; i++)
+        // Root replacement
+        if (string.IsNullOrEmpty(key))
         {
-            var segment = segments[i];
-            if (i == segments.Length - 1)
+            if (newNode is null)
             {
-                // Last segment, set the value
-                SetNodeValue(context, segment, value);
-                break;
+                _jsonObj = new JsonObject();
+                Data = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+                return;
             }
-
-            // Navigate or create path
-            context = GetOrCreateNextNode(context, segment, segments[i + 1]);
-        }
-    }
-
-    private static JsonNode GetOrCreateNextNode(JsonNode context, string segment, string nextSegment)
-    {
-        if (int.TryParse(segment, out var index) && context is JsonArray array)
-        {
-            while (array.Count <= index) array.Add(null);
-            return array[index] ??= int.TryParse(nextSegment, out _) ? new JsonArray() : new JsonObject();
+            if (newNode is not JsonObject rootObj)
+                throw new InvalidOperationException("Root must be a JSON object.");
+            _jsonObj = rootObj;
+            Data = PopulateDataFromNode(_jsonObj);
+            return;
         }
 
-        if (context is JsonObject obj)
+        // Navigate/create parent container
+        var segments = key.Split(ConfigurationPath.KeyDelimiter);
+        JsonNode current = _jsonObj;
+
+        for (int i = 0; i < segments.Length - 1; i++)
         {
-            return obj[segment] ??= int.TryParse(nextSegment, out _) ? new JsonArray() : new JsonObject();
+            var seg = segments[i];
+            var nextIsIndex = int.TryParse(segments[i + 1], out _);
+
+            if (int.TryParse(seg, out var arrIndex))
+            {
+                if (current is not JsonArray arr)
+                    throw new InvalidOperationException($"Path segment '{seg}' expects an array.");
+                while (arr.Count <= arrIndex) arr.Add(null);
+                current = arr[arrIndex] ??= nextIsIndex ? new JsonArray() : new JsonObject();
+            }
+            else
+            {
+                if (current is not JsonObject obj)
+                    throw new InvalidOperationException($"Path segment '{seg}' expects an object.");
+                current = obj[seg] ??= nextIsIndex ? new JsonArray() : new JsonObject();
+            }
         }
 
-        // This indicates a path mismatch, e.g., trying to access a property on an array by name.
-        // For simplicity, we throw. A more robust implementation might handle this differently.
-        throw new InvalidOperationException($"Cannot create child node on a non-object/array node at path segment '{segment}'.");
-    }
+        var last = segments[^1];
 
-    private static void SetNodeValue(JsonNode context, string segment, string? value)
-    {
-        var jsonValue = JsonValue.Create(value);
-        if (int.TryParse(segment, out var index) && context is JsonArray array)
+        // Apply physical JsonNode replacement
+        if (current is JsonObject parentObj && !int.TryParse(last, out _))
         {
-            while (array.Count <= index) array.Add(null);
-            array[index] = jsonValue;
+            parentObj[last] = newNode;
         }
-        else if (context is JsonObject obj)
+        else if (current is JsonArray parentArr && int.TryParse(last, out var lastIdx))
         {
-            obj[segment] = jsonValue;
+            while (parentArr.Count <= lastIdx) parentArr.Add(null);
+            parentArr[lastIdx] = newNode;
         }
         else
         {
-            throw new InvalidOperationException($"Cannot set value on a non-object/array node at path segment '{segment}'.");
+            throw new InvalidOperationException("Incompatible container for the final segment.");
+        }
+
+        // Remove old flattened keys beneath this path
+        var prefix = key + ConfigurationPath.KeyDelimiter;
+        var toRemove = Data.Keys
+            .Where(k => k.Equals(key, StringComparison.OrdinalIgnoreCase) ||
+                k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        foreach (var del in toRemove) Data.Remove(del);
+
+        // Re-flatten new subtree
+        if (newNode is null)
+        {
+            Data[key] = null;
+        }
+        else
+        {
+            FlattenNode(newNode, key, Data);
+        }
+    }
+
+    /// <summary>
+    /// Flatten a subtree into configuration key/value pairs.
+    /// </summary>
+    private static void FlattenNode(JsonNode node, string basePath, IDictionary<string, string?> target)
+    {
+        switch (node)
+        {
+            case JsonObject obj:
+            {
+                if (obj.Count == 0)
+                {
+                    target[basePath] = null;
+                    return;
+                }
+                foreach (var kv in obj)
+                {
+                    var childPath = ConfigurationPath.Combine(basePath, kv.Key);
+                    if (kv.Value is null)
+                        target[childPath] = null;
+                    else
+                        FlattenNode(kv.Value, childPath, target);
+                }
+                break;
+            }
+            case JsonArray arr:
+            {
+                if (arr.Count == 0)
+                {
+                    target[basePath] = null;
+                    return;
+                }
+                for (int i = 0; i < arr.Count; i++)
+                {
+                    var childPath = ConfigurationPath.Combine(basePath, i.ToString());
+                    var v = arr[i];
+                    if (v is null)
+                        target[childPath] = null;
+                    else
+                        FlattenNode(v, childPath, target);
+                }
+                break;
+            }
+            case JsonValue val:
+            {
+                target[basePath] = val.ToString();
+                break;
+            }
         }
     }
 

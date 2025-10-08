@@ -1,44 +1,45 @@
 using Microsoft.Extensions.Configuration;
-using Xunit.Sdk;
 
-namespace WritableJsonConfiguration.Tests
+namespace WritableJsonConfiguration.Tests;
+
+[TestFixture]
+public class ConfigTests
 {
-    public class ConfigTests : IDisposable
+    private IConfigurationRoot _configuration;
+
+    [SetUp]
+    public void SetUp()
     {
-        readonly IConfigurationRoot configuration;
+        _configuration = WritableJsonConfigurationFabric.Create("Settings.json");
+    }
 
-        public ConfigTests()
+    [TearDown]
+    public void TearDown()
+    {
+        var provider = _configuration.Providers.First() as WritableJsonConfigurationProvider;
+        var fileName = provider?.Source.Path;
+        if (!string.IsNullOrEmpty(fileName) && File.Exists(fileName))
         {
-            configuration = WritableJsonConfigurationFabric.Create("Settings.json");
+            try { File.Delete(fileName); } catch { /* ignore */ }
         }
+    }
 
-        public void Dispose()
-        {
-            var config = configuration.Providers.First() as WritableJsonConfigurationProvider;
-            var fileName = config.Source.Path;
-            File.Delete(fileName);
-        }
+    [Test]
+    public void ArrayTest()
+    {
+        var array = new[] { "1", "a" };
+        _configuration.Set("array", array);
+        var result = _configuration.Get<string[]>("array");
+        Assert.That(result, Is.EqualTo(array));
+    }
 
-        [Fact]
-        public void ArrayTest()
-        {
-            
-            var array = new string[] { "1", "a" };
-            configuration.Set("array", array);
-            var result = configuration.Get<string[]>("array");
-            Assert.Equal(array, result);
-            
-        }
-
-        [Fact]
-        public void ArraySectionTest()
-        {
-            IConfigurationRoot configuration = WritableJsonConfigurationFabric.Create("Settings.json");
-            var array = new string[] { "1", "a" };
-            configuration.GetSection("data").Set("array", array);
-            var result = configuration.GetSection("data").Get<string[]>("array");
-            Assert.Equal(array, result);
-        }
-
+    [Test]
+    public void ArraySectionTest()
+    {
+        var c = WritableJsonConfigurationFabric.Create("Settings.json");
+        var array = new[] { "1", "a" };
+        c.GetSection("data").Set("array", array);
+        var result = c.GetSection("data").Get<string[]>("array");
+        Assert.That(result, Is.EqualTo(array));
     }
 }
