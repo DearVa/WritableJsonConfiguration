@@ -7,12 +7,34 @@ using Microsoft.Extensions.Configuration.Json;
 namespace WritableJsonConfiguration;
 
 /// <summary>
+/// Simple write error event args (cross-platform; no severity classification).
+/// </summary>
+public sealed class ConfigurationWriteErrorEventArgs(
+    Exception exception,
+    int attempt,
+    string filePath,
+    int contentLength
+) : EventArgs
+{
+    public Exception Exception { get; } = exception;
+    public int Attempt { get; } = attempt;
+    public string FilePath { get; } = filePath;
+    public int ContentLength { get; } = contentLength;
+}
+
+/// <summary>
 /// A sophisticated, thread-safe, and high-performance writable JSON configuration provider.
 /// It employs ReaderWriterLockSlim for optimized concurrent access in read-heavy scenarios,
 /// and a debounced, asynchronous mechanism for file writing to minimize I/O overhead.
 /// </summary>
 public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvider, IDisposable
 {
+    /// <summary>
+    /// Event triggered when a write error occurs during file save operations.
+    /// Subscribers can use this event to log errors or implement retry logic.
+    /// </summary>
+    public event EventHandler<ConfigurationWriteErrorEventArgs>? WriteError;
+
     private const int DebounceMilliseconds = 200;
 
     private readonly string _fileFullPath;
@@ -282,6 +304,14 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
         }
     }
 
+    public void Flush() => FlushAsync().GetAwaiter().GetResult(); // Force synchronous flush
+
+    public async Task FlushAsync(CancellationToken cancellationToken = default)
+    {
+        Interlocked.Exchange(ref _saveQueued, 0);
+        await SaveSnapshotToFileAsync(force: true, cancellationToken).ConfigureAwait(false);
+    }
+
     private void QueueSave()
     {
         // Mark that a save is desired.
@@ -319,7 +349,9 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
             }
 
             // Perform the save.
-            await SaveToFileAsync(_cts.Token);
+            await SaveSnapshotToFileAsync(false, _cts.Token);
+
+            if (Volatile.Read(ref _saveQueued) == 0) break;
         }
 
         // After the loop (either by breaking or cancellation),
@@ -328,16 +360,30 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
         if (Interlocked.Exchange(ref _saveQueued, 0) == 1)
         {
             // Use CancellationToken.None to ensure this final write completes even if disposal has been initiated.
-            await SaveToFileAsync(CancellationToken.None);
+            await SaveSnapshotToFileAsync(true, CancellationToken.None);
         }
     }
 
-    private async Task SaveToFileAsync(CancellationToken cancellationToken)
+    private Task SaveSnapshotToFileAsync(bool force, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return DoAtomicWriteAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            RaiseWriteError(ex, 0, -1, _fileFullPath);
+            if (force) throw;
+            return Task.CompletedTask;
+        }
+    }
+
+    private async Task DoAtomicWriteAsync(CancellationToken cancellationToken)
     {
         if (cancellationToken.IsCancellationRequested) return;
 
         string content;
-        _lock.EnterReadLock(); // Only need a read lock to serialize the object
+        _lock.EnterReadLock();
         try
         {
             content = _jsonObj?.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) ?? "{}";
@@ -347,66 +393,128 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
             _lock.ExitReadLock();
         }
 
-        // --- Atomic Write using Write-and-Rename Pattern ---
+        var bytesLen = Encoding.UTF8.GetByteCount(content);
+        var dir = Path.GetDirectoryName(_fileFullPath)!;
+        Directory.CreateDirectory(dir);
 
-        if (File.Exists(_fileFullPath))
+        // Create temp file in same directory (required for atomic replace/move semantics)
+        var tempPath = Path.Combine(dir, Path.GetRandomFileName());
+
+        // We allow at most 2 attempts (initial + 1 quick retry) to soften transient sharing issues.
+        const int MaxAttempts = 2;
+        for (var attempt = 1; attempt <= MaxAttempts; attempt++)
         {
-            // 1. Get a temporary file path in the same directory.
-            // This is crucial for the atomic move operation to work reliably.
-            var tempFilePath = Path.Combine(Path.GetDirectoryName(_fileFullPath)!, Path.GetRandomFileName());
-
             try
             {
-                // 2. Write the new content to the temporary file.
-                await File.WriteAllTextAsync(tempFilePath, content, Encoding.UTF8, cancellationToken);
+                await using (var fs = new FileStream(
+                                 tempPath,
+                                 FileMode.CreateNew,
+                                 FileAccess.Write,
+                                 FileShare.None,
+                                 64 * 1024,
+                                 FileOptions.Asynchronous)) // Keep simple; avoid platform-specific flags
+                {
+                    var buffer = Encoding.UTF8.GetBytes(content);
+                    await fs.WriteAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
+                    await fs.FlushAsync(cancellationToken).ConfigureAwait(false);
+                }
 
-                // 3. Atomically replace the original file with the new one.
-                // On most filesystems, this is an atomic operation.
-                File.Replace(tempFilePath, _fileFullPath, null);
-            }
-            catch
-            {
-                // If any error occurs, ensure the temporary file is cleaned up.
-                if (File.Exists(tempFilePath))
+                // Overwrite strategy (cross-platform):
+#if NET8_0_OR_GREATER
+                // File.Move(..., overwrite: true) handles overwrite atomically per platform guarantees.
+                File.Move(tempPath, _fileFullPath, overwrite: true);
+#else
+                if (File.Exists(_fileFullPath))
                 {
                     try
                     {
-                        File.Delete(tempFilePath);
+                        // Prefer Replace when available (Windows atomic), works on Unix too.
+                        File.Replace(tempPath, _fileFullPath, null);
                     }
                     catch
                     {
-                        // Ignore exceptions during cleanup. The original file is still intact.
+                        // Fallback: delete then move (small non-atomic window but acceptable here).
+                        TryDeleteFileSafe(_fileFullPath);
+                        File.Move(tempPath, _fileFullPath);
                     }
                 }
-
-                // Re-throw the original exception to signal that the save failed.
-                throw;
+                else
+                {
+                    File.Move(tempPath, _fileFullPath);
+                }
+#endif
+                return; // Success
             }
-        }
-        else
-        {
-            await File.WriteAllTextAsync(_fileFullPath, content, Encoding.UTF8, cancellationToken);
+            catch (OperationCanceledException)
+            {
+                // Respect cancellation
+                break;
+            }
+            catch (Exception ex)
+            {
+                RaiseWriteError(ex, attempt, bytesLen, _fileFullPath);
+
+                // Clean temp if still present
+                SafeDelete(tempPath);
+
+                if (attempt == MaxAttempts) break;
+
+                // Quick minimal retry delay
+                await Task.Delay(50, CancellationToken.None).ConfigureAwait(false);
+
+                // Recreate temp path for next attempt
+                tempPath = Path.Combine(dir, Path.GetRandomFileName());
+            }
         }
     }
 
+    private static void SafeDelete(string path)
+    {
+        try
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+        catch
+        {
+            // Ignore
+        }
+    }
+
+    private void RaiseWriteError(Exception ex, int attempt, int contentLength, string filePath)
+    {
+        try
+        {
+            WriteError?.Invoke(this, new ConfigurationWriteErrorEventArgs(ex, attempt, filePath, contentLength));
+        }
+        catch
+        {
+            // Ignore
+        }
+    }
+
+// --- Dispose: add final Flush to ensure last state persisted ---
     void IDisposable.Dispose()
     {
-        // Signal cancellation to the running task's loop.
         _cts.Cancel();
         try
         {
-            // Wait for the save task to complete gracefully.
-            // This now correctly waits for the final save operation if one was pending.
             _saveTask.Wait();
         }
-        catch (Exception)
+        catch
         {
-            // Log or ignore other exceptions during disposal.
+            // Ignore
         }
-        finally
+
+        try
         {
-            _cts.Dispose();
-            _lock.Dispose();
+            Flush();
         }
+        catch
+        {
+            // Ignore
+        }
+
+        _cts.Dispose();
+        _lock.Dispose();
     }
 }
