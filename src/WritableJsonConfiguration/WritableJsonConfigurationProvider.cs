@@ -1,6 +1,7 @@
 ﻿using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Configuration.Json;
 
@@ -38,8 +39,10 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
     private const int DebounceMilliseconds = 200;
 
     private readonly string _fileFullPath;
+    private readonly JsonSerializerOptions _jsonOptions;
     private readonly ReaderWriterLockSlim _lock = new(LockRecursionPolicy.NoRecursion);
     private readonly CancellationTokenSource _cts = new();
+
     private JsonNode? _jsonObj;
 
     // Initialize to a completed task to simplify the logic.
@@ -50,6 +53,13 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
     {
         _fileFullPath = Source.FileProvider?.GetFileInfo(Source.Path ?? string.Empty).PhysicalPath
             ?? throw new FileNotFoundException("JSON configuration file not found.");
+        _jsonOptions = new JsonSerializerOptions
+        {
+            Converters = { new JsonStringEnumConverter() },
+            WriteIndented = true,
+            AllowTrailingCommas = true,
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+        };
     }
 
     public override IEnumerable<string> GetChildKeys(IEnumerable<string> earlierKeys, string? parentPath)
@@ -74,7 +84,7 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
         {
             using var reader = new StreamReader(stream);
             var json = reader.ReadToEnd();
-            _jsonObj = JsonNode.Parse(json) ?? new JsonObject();
+            _jsonObj = JsonNode.Parse(json, documentOptions: new JsonDocumentOptions { AllowTrailingCommas = true }) ?? new JsonObject();
             Data = PopulateDataFromNode(_jsonObj);
         }
         finally
@@ -208,7 +218,7 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
     {
         // Serialize outside the lock to prevent potential deadlocks if serialization
         // logic tries to read configuration.
-        var node = JsonSerializer.SerializeToNode(value);
+        var node = JsonSerializer.SerializeToNode(value, _jsonOptions);
 
         _lock.EnterWriteLock();
         try
@@ -248,9 +258,9 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
 
         // Navigate/create parent container
         var segments = key.Split(ConfigurationPath.KeyDelimiter);
-        JsonNode current = _jsonObj;
+        var current = _jsonObj;
 
-        for (int i = 0; i < segments.Length - 1; i++)
+        for (var i = 0; i < segments.Length - 1; i++)
         {
             var seg = segments[i];
             var nextIsIndex = int.TryParse(segments[i + 1], out _);
@@ -259,6 +269,7 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
             {
                 if (current is not JsonArray arr)
                     throw new InvalidOperationException($"Path segment '{seg}' expects an array.");
+
                 while (arr.Count <= arrIndex) arr.Add(null);
                 current = arr[arrIndex] ??= nextIsIndex ? new JsonArray() : new JsonObject();
             }
@@ -266,25 +277,31 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
             {
                 if (current is not JsonObject obj)
                     throw new InvalidOperationException($"Path segment '{seg}' expects an object.");
+
                 current = obj[seg] ??= nextIsIndex ? new JsonArray() : new JsonObject();
             }
         }
 
         var last = segments[^1];
 
-        // Apply physical JsonNode replacement
-        if (current is JsonObject parentObj && !int.TryParse(last, out _))
+        switch (current)
         {
-            parentObj[last] = newNode;
-        }
-        else if (current is JsonArray parentArr && int.TryParse(last, out var lastIdx))
-        {
-            while (parentArr.Count <= lastIdx) parentArr.Add(null);
-            parentArr[lastIdx] = newNode;
-        }
-        else
-        {
-            throw new InvalidOperationException("Incompatible container for the final segment.");
+            // Apply physical JsonNode replacement
+            case JsonObject parentObj when !int.TryParse(last, out _):
+            {
+                parentObj[last] = newNode;
+                break;
+            }
+            case JsonArray parentArr when int.TryParse(last, out var lastIdx):
+            {
+                while (parentArr.Count <= lastIdx) parentArr.Add(null);
+                parentArr[lastIdx] = newNode;
+                break;
+            }
+            default:
+            {
+                throw new InvalidOperationException("Incompatible container for the final segment.");
+            }
         }
 
         // Remove old flattened keys beneath this path
@@ -337,7 +354,7 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
                     target[basePath] = null;
                     return;
                 }
-                for (int i = 0; i < arr.Count; i++)
+                for (var i = 0; i < arr.Count; i++)
                 {
                     var childPath = ConfigurationPath.Combine(basePath, i.ToString());
                     var v = arr[i];
@@ -438,7 +455,7 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
         _lock.EnterReadLock();
         try
         {
-            content = _jsonObj?.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) ?? "{}";
+            content = _jsonObj?.ToJsonString(_jsonOptions) ?? "{}";
         }
         finally
         {
@@ -544,7 +561,6 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
         }
     }
 
-// --- Dispose: add final Flush to ensure last state persisted ---
     void IDisposable.Dispose()
     {
         _cts.Cancel();
