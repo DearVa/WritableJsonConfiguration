@@ -58,7 +58,8 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
             Converters = { new JsonStringEnumConverter() },
             WriteIndented = true,
             AllowTrailingCommas = true,
-            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+            IgnoreReadOnlyProperties = true
         };
     }
 
