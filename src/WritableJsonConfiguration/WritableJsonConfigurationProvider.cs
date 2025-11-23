@@ -1,27 +1,12 @@
 ﻿using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Text.Json.Serialization;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Configuration.Json;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace WritableJsonConfiguration;
-
-/// <summary>
-/// Simple write error event args (cross-platform; no severity classification).
-/// </summary>
-public sealed class ConfigurationWriteErrorEventArgs(
-    Exception exception,
-    int attempt,
-    string filePath,
-    int contentLength
-) : EventArgs
-{
-    public Exception Exception { get; } = exception;
-    public int Attempt { get; } = attempt;
-    public string FilePath { get; } = filePath;
-    public int ContentLength { get; } = contentLength;
-}
 
 /// <summary>
 /// A sophisticated, thread-safe, and high-performance writable JSON configuration provider.
@@ -30,37 +15,30 @@ public sealed class ConfigurationWriteErrorEventArgs(
 /// </summary>
 public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvider, IDisposable
 {
-    /// <summary>
-    /// Event triggered when a write error occurs during file save operations.
-    /// Subscribers can use this event to log errors or implement retry logic.
-    /// </summary>
-    public event EventHandler<ConfigurationWriteErrorEventArgs>? WriteError;
-
     private const int DebounceMilliseconds = 200;
 
+    private readonly ILogger _logger;
     private readonly string _fileFullPath;
-    private readonly JsonSerializerOptions _jsonOptions;
+    private readonly JsonSerializerOptions _jsonSerializerOptions;
     private readonly ReaderWriterLockSlim _lock = new(LockRecursionPolicy.NoRecursion);
     private readonly CancellationTokenSource _cts = new();
 
     private JsonNode? _jsonObj;
 
-    // Initialize to a completed task to simplify the logic.
-    private Task _saveTask = Task.CompletedTask;
-    private int _saveQueued; // 0 = false, 1 = true
+    private readonly Task _saveLoopTask;
+    private readonly SemaphoreSlim _signal = new(0);
+    private volatile bool _isDirty;
 
-    public WritableJsonConfigurationProvider(JsonConfigurationSource source) : base(source)
+    public WritableJsonConfigurationProvider(WritableJsonConfigurationSource source, ILogger? logger = null) : base(source)
     {
+        _logger = logger ?? NullLogger.Instance;
+
         _fileFullPath = Source.FileProvider?.GetFileInfo(Source.Path ?? string.Empty).PhysicalPath
             ?? throw new FileNotFoundException("JSON configuration file not found.");
-        _jsonOptions = new JsonSerializerOptions
-        {
-            Converters = { new JsonStringEnumConverter() },
-            WriteIndented = true,
-            AllowTrailingCommas = true,
-            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-            IgnoreReadOnlyProperties = true
-        };
+        _jsonSerializerOptions = source.JsonSerializerOptions;
+
+        // Start the background save loop task.
+        _saveLoopTask = Task.Run(SaveLoopAsync);
     }
 
     public override IEnumerable<string> GetChildKeys(IEnumerable<string> earlierKeys, string? parentPath)
@@ -201,7 +179,7 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
             ReplaceSubtree(key, value);
 
             // Trigger a debounced save operation
-            QueueSave();
+            SignalChange();
         }
         finally
         {
@@ -219,17 +197,35 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
     {
         // Serialize outside the lock to prevent potential deadlocks if serialization
         // logic tries to read configuration.
-        var node = JsonSerializer.SerializeToNode(value, _jsonOptions);
+        var node = JsonSerializer.SerializeToNode(value, _jsonSerializerOptions);
 
         _lock.EnterWriteLock();
         try
         {
             ReplaceSubtree(key, node);
-            QueueSave();
+            SignalChange();
         }
         finally
         {
             _lock.ExitWriteLock();
+        }
+    }
+
+    /// <summary>
+    /// Signals that the configuration has changed and triggers the save loop.
+    /// </summary>
+    private void SignalChange()
+    {
+        _isDirty = true;
+
+        // Release a signal if the count is 0.
+        // We don't need to accumulate signals, just know that "there is a change".
+        if (_signal.CurrentCount == 0)
+        {
+            try { _signal.Release(); }
+            catch
+            { /* ignored */
+            }
         }
     }
 
@@ -374,63 +370,45 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
         }
     }
 
-    public void Flush() => FlushAsync().GetAwaiter().GetResult(); // Force synchronous flush
-
     public async Task FlushAsync(CancellationToken cancellationToken = default)
     {
-        Interlocked.Exchange(ref _saveQueued, 0);
-        await SaveSnapshotToFileAsync(force: true, cancellationToken).ConfigureAwait(false);
-    }
-
-    private void QueueSave()
-    {
-        // Mark that a save is desired.
-        Interlocked.Exchange(ref _saveQueued, 1);
-
-        // If the save task is already completed, start a new one.
-        // This check is not atomic, but SaveLoopAsync handles the race condition internally.
-        if (_saveTask.IsCompleted)
+        // Only force save if there are actual changes
+        if (_isDirty)
         {
-            _saveTask = SaveLoopAsync();
+            await SaveSnapshotToFileAsync(force: true, cancellationToken).ConfigureAwait(false);
         }
     }
 
     private async Task SaveLoopAsync()
     {
-        // Loop while there are pending saves or cancellation hasn't been requested yet.
-        while (!_cts.IsCancellationRequested)
+        try
         {
-            try
+            while (!_cts.IsCancellationRequested)
             {
-                // Debounce: wait for a quiet period.
+                // 1. Wait for signal
+                await _signal.WaitAsync(_cts.Token);
+
+                // 2. Debounce delay
                 await Task.Delay(DebounceMilliseconds, _cts.Token);
-            }
-            catch (OperationCanceledException)
-            {
-                // This is expected when Dispose is called. Break the loop to perform a final save.
-                break;
-            }
 
-            // Atomically check if a save is needed and reset the flag.
-            if (Interlocked.Exchange(ref _saveQueued, 0) == 0)
-            {
-                // No save was requested during the delay. We can exit the loop.
-                break;
+                // 3. Consume all additional signals generated during the delay (avoid duplicate loops)
+                while (_signal.CurrentCount > 0) await _signal.WaitAsync(0);
+
+                // 4. If there are indeed changes, perform save
+                if (_isDirty)
+                {
+                    await SaveSnapshotToFileAsync(false, _cts.Token);
+                }
             }
-
-            // Perform the save.
-            await SaveSnapshotToFileAsync(false, _cts.Token);
-
-            if (Volatile.Read(ref _saveQueued) == 0) break;
         }
-
-        // After the loop (either by breaking or cancellation),
-        // there might be a pending save request that came in after the last check.
-        // Perform one final save if needed, ensuring data is not lost on disposal.
-        if (Interlocked.Exchange(ref _saveQueued, 0) == 1)
+        catch (OperationCanceledException)
         {
-            // Use CancellationToken.None to ensure this final write completes even if disposal has been initiated.
-            await SaveSnapshotToFileAsync(true, CancellationToken.None);
+            // Ignored
+        }
+        catch (Exception ex)
+        {
+            // Should not happen, prevent loop crash
+            _logger.LogError(ex, "An exception occurred while writing to file.");
         }
     }
 
@@ -456,7 +434,12 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
         _lock.EnterReadLock();
         try
         {
-            content = _jsonObj?.ToJsonString(_jsonOptions) ?? "{}";
+            content = _jsonObj?.ToJsonString(_jsonSerializerOptions) ?? "{}";
+
+            // Key point: Reset the dirty flag while holding the lock.
+            // This means "we have captured all changes up to this moment".
+            // If new Set calls come in after releasing the lock, they will set _isDirty to true again and trigger the next save.
+            _isDirty = false;
         }
         finally
         {
@@ -467,11 +450,9 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
         var dir = Path.GetDirectoryName(_fileFullPath)!;
         Directory.CreateDirectory(dir);
 
-        // Create temp file in same directory (required for atomic replace/move semantics)
         var tempPath = Path.Combine(dir, Path.GetRandomFileName());
-
-        // We allow at most 2 attempts (initial + 1 quick retry) to soften transient sharing issues.
         const int MaxAttempts = 2;
+
         for (var attempt = 1; attempt <= MaxAttempts; attempt++)
         {
             try
@@ -482,84 +463,57 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
                                  FileAccess.Write,
                                  FileShare.None,
                                  64 * 1024,
-                                 FileOptions.Asynchronous)) // Keep simple; avoid platform-specific flags
+                                 FileOptions.Asynchronous))
                 {
                     var buffer = Encoding.UTF8.GetBytes(content);
                     await fs.WriteAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
                     await fs.FlushAsync(cancellationToken).ConfigureAwait(false);
                 }
 
-                // Overwrite strategy (cross-platform):
 #if NET8_0_OR_GREATER
-                // File.Move(..., overwrite: true) handles overwrite atomically per platform guarantees.
                 File.Move(tempPath, _fileFullPath, overwrite: true);
 #else
                 if (File.Exists(_fileFullPath))
                 {
-                    try
-                    {
-                        // Prefer Replace when available (Windows atomic), works on Unix too.
-                        File.Replace(tempPath, _fileFullPath, null);
-                    }
-                    catch
-                    {
-                        // Fallback: delete then move (small non-atomic window but acceptable here).
-                        TryDeleteFileSafe(_fileFullPath);
-                        File.Move(tempPath, _fileFullPath);
-                    }
+                    try { File.Replace(tempPath, _fileFullPath, null); }
+                    catch { TryDeleteFileSafe(_fileFullPath); File.Move(tempPath, _fileFullPath); }
                 }
-                else
-                {
-                    File.Move(tempPath, _fileFullPath);
-                }
+                else { File.Move(tempPath, _fileFullPath); }
 #endif
-                return; // Success
+                return;
             }
-            catch (OperationCanceledException)
-            {
-                // Respect cancellation
-                break;
-            }
+            catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
                 RaiseWriteError(ex, attempt, bytesLen, _fileFullPath);
-
-                // Clean temp if still present
                 SafeDelete(tempPath);
-
                 if (attempt == MaxAttempts) break;
-
-                // Quick minimal retry delay
                 await Task.Delay(50, CancellationToken.None).ConfigureAwait(false);
-
-                // Recreate temp path for next attempt
                 tempPath = Path.Combine(dir, Path.GetRandomFileName());
             }
         }
     }
 
-    private static void SafeDelete(string path)
+    private void SafeDelete(string path)
     {
         try
         {
             if (File.Exists(path)) File.Delete(path);
         }
-        catch
+        catch (Exception ex)
         {
-            // Ignore
+            _logger.LogWarning(ex, "Failed to delete temporary file '{TempPath}'", path);
         }
     }
 
     private void RaiseWriteError(Exception ex, int attempt, int contentLength, string filePath)
     {
-        try
-        {
-            WriteError?.Invoke(this, new ConfigurationWriteErrorEventArgs(ex, attempt, filePath, contentLength));
-        }
-        catch
-        {
-            // Ignore
-        }
+        _logger.LogError(
+            ex,
+            "Failed to write JSON configuration to '{FilePath}' (Attempt {Attempt}, Content Length: {ContentLength} bytes)",
+            filePath,
+            attempt,
+            contentLength);
     }
 
     void IDisposable.Dispose()
@@ -567,16 +521,7 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
         _cts.Cancel();
         try
         {
-            _saveTask.Wait();
-        }
-        catch
-        {
-            // Ignore
-        }
-
-        try
-        {
-            Flush();
+            _saveLoopTask.Wait();
         }
         catch
         {
@@ -585,5 +530,6 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
 
         _cts.Dispose();
         _lock.Dispose();
+        _signal.Dispose();
     }
 }

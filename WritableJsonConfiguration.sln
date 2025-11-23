@@ -11,7 +11,7 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution 
 		resources\JSON_logo.png = resources\JSON_logo.png
 	EndProjectSection
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WritableJsonConfiguration.Tests", "WritableJsonConfiguration.Tests\WritableJsonConfiguration.Tests.csproj", "{F8019035-BA23-4092-9C3E-D1E9927D6EB7}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "src\WritableJsonConfiguration.Tests", "WritableJsonConfiguration.Tests\WritableJsonConfiguration.Tests.csproj", "{F8019035-BA23-4092-9C3E-D1E9927D6EB7}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

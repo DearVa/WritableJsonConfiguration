@@ -16,7 +16,7 @@
     </ItemGroup>
 
     <ItemGroup>
-        <ProjectReference Include="..\src\WritableJsonConfiguration\WritableJsonConfiguration.csproj"/>
+        <ProjectReference Include="..\WritableJsonConfiguration\WritableJsonConfiguration.csproj"/>
     </ItemGroup>
 
 </Project>
