@@ -8,17 +8,20 @@ namespace WritableJsonConfiguration;
 
 public class WritableJsonConfigurationSource : JsonConfigurationSource
 {
-    public ILoggerFactory? LoggerFactory { get; set; }
-
-    public JsonSerializerOptions JsonSerializerOptions { get; set; } =
+    public static JsonSerializerOptions DefaultJsonSerializerOptions { get; } =
         new()
         {
             Converters = { new JsonStringEnumConverter() },
             WriteIndented = true,
             AllowTrailingCommas = true,
             Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-            IgnoreReadOnlyProperties = true
+            IgnoreReadOnlyProperties = true,
+            ReadCommentHandling = JsonCommentHandling.Skip
         };
+
+    public ILoggerFactory? LoggerFactory { get; set; }
+
+    public JsonSerializerOptions JsonSerializerOptions { get; set; } = DefaultJsonSerializerOptions;
 
     public override IConfigurationProvider Build(IConfigurationBuilder builder)
     {
