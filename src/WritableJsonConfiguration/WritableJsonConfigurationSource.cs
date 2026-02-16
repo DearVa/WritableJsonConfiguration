@@ -1,4 +1,5 @@
-﻿using System.Text.Json;
+﻿using System.Text.Encodings.Web;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Configuration.Json;
@@ -8,20 +9,26 @@ namespace WritableJsonConfiguration;
 
 public class WritableJsonConfigurationSource : JsonConfigurationSource
 {
-    public static JsonSerializerOptions DefaultJsonSerializerOptions { get; } =
-        new()
-        {
-            Converters = { new JsonStringEnumConverter() },
-            WriteIndented = true,
-            AllowTrailingCommas = true,
-            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-            IgnoreReadOnlyProperties = true,
-            ReadCommentHandling = JsonCommentHandling.Skip
-        };
+    public static JsonSerializerOptions DefaultJsonSerializerOptions { get; }
 
     public ILoggerFactory? LoggerFactory { get; set; }
 
     public JsonSerializerOptions JsonSerializerOptions { get; set; } = DefaultJsonSerializerOptions;
+
+    static WritableJsonConfigurationSource()
+    {
+        DefaultJsonSerializerOptions = new JsonSerializerOptions
+        {
+            Converters = { new JsonStringEnumConverter() },
+            WriteIndented = true,
+            AllowTrailingCommas = true,
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+            IgnoreReadOnlyProperties = true,
+            ReadCommentHandling = JsonCommentHandling.Skip,
+        };
+
+        DefaultJsonSerializerOptions.MakeReadOnly(true);
+    }
 
     public override IConfigurationProvider Build(IConfigurationBuilder builder)
     {
