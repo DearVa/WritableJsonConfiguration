@@ -63,8 +63,23 @@ public sealed class WritableJsonConfigurationProvider : JsonConfigurationProvide
         {
             using var reader = new StreamReader(stream);
             var json = reader.ReadToEnd();
-            _jsonObj = JsonNode.Parse(json, documentOptions: new JsonDocumentOptions { AllowTrailingCommas = true }) ?? new JsonObject();
+            _jsonObj = JsonNode.Parse(
+                json,
+                documentOptions: new JsonDocumentOptions
+                {
+                    AllowTrailingCommas = true,
+                    AllowDuplicateProperties = true,
+                    CommentHandling = JsonCommentHandling.Skip
+                }) ?? new JsonObject();
             Data = PopulateDataFromNode(_jsonObj);
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogError(ex, "Failed to parse JSON configuration");
+
+            // Start with empty configuration on parse failure, but keep the provider functional for future writes.
+            _jsonObj = new JsonObject();
+            Data = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         }
         finally
         {
