@@ -1,6 +1,7 @@
 ﻿using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Configuration.Json;
 using Microsoft.Extensions.Logging;
@@ -17,6 +18,9 @@ public class WritableJsonConfigurationSource : JsonConfigurationSource
 
     static WritableJsonConfigurationSource()
     {
+        var resolver = new DefaultJsonTypeInfoResolver();
+        resolver.Modifiers.Add(OptionalJsonConverterFactory.JsonTypeInfoResolverModifier);
+
         DefaultJsonSerializerOptions = new JsonSerializerOptions
         {
             Converters = { new JsonStringEnumConverter() },
@@ -25,6 +29,7 @@ public class WritableJsonConfigurationSource : JsonConfigurationSource
             Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
             IgnoreReadOnlyProperties = true,
             ReadCommentHandling = JsonCommentHandling.Skip,
+            TypeInfoResolver = resolver
         };
 
         DefaultJsonSerializerOptions.MakeReadOnly(true);
